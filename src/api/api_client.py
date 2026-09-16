@@ -1,12 +1,17 @@
+import json
+import os
 import httpx
 import time
-import json
 from pathlib import Path
-from datetime import datetime, UTC
+import hashlib
 
-BASE_URL = "https://dummyjson.com"
 MAX_RETRIES = 3
-RETRYABLE_STATUS_CODES = {429, *range(500, 600)}
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+BASE_URL = os.getenv(
+    "DUMMYJSON_BASE_URL",
+    "https://dummyjson.com",
+)
 
 # manage pagination in blucle until the skip = total
 
@@ -41,8 +46,21 @@ def _fetch_page(endpoint, params=None):
                 delay = 2**retry
             time.sleep(delay)
 
-def _validate_page(payload, resource, *, skip, limit, expected_total):
+def _validate_page(http_response, resource, *, skip, limit, expected_total):
     required_fields = {resource, 'total', 'skip', 'limit'}
+
+    content_type = http_response.headers.get("Content-Type", "").lower()
+    if "application/json" not in content_type:
+        raise ValueError(f"Expected application/json, received {content_type or 'missing'}")
+
+    try:
+        payload = http_response.json()
+    except json.JSONDecodeError as error:
+        raise ValueError("Response does not contain valid JSON") from error
+
+    if not isinstance(payload, dict):
+        raise ValueError("Response JSON must be an object")
+
     missing_fields = required_fields - payload.keys()
 
     if missing_fields:
@@ -73,47 +91,49 @@ def _validate_page(payload, resource, *, skip, limit, expected_total):
         raise ValueError(
             f"Unexpected skip: requested={skip}, returned={payload['skip']}"
         )
-    
+
     for item in items:
         if not isinstance(item, dict) or "id" not in item:
             raise ValueError(f"Invalid item in '{resource}'")
 
     return items, total
 
-def _save_raw_page(payload, resource, params, run_id, status_code):
+def _save_raw_page(resource, params, run_id,* , response_body):
     folder = "output/raw"
     file_path = Path(folder) / run_id / f"{resource}_skip_{params['skip']}.json"
     file_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_path.open('xb') as raw_file:
+        raw_file.write(response_body)
+    return file_path
 
-    with open(file_path, "w") as f:
-        json.dump(
-            {
-                "body": payload,
-                "status": status_code,
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "resource": resource,
-                "params": params,
-            },
-            f,
-            indent=4,
-        )
+def _calculate_hash(response_in_bytes):
+    return hashlib.sha256(response_in_bytes).hexdigest()
 
 
-def _get_all(endpoint, resource, *, extra_params=None):
+def _get_all(endpoint, resource, *, extra_params=None, run_id):
     skip, limit, total = 0, 10, None
     all_items = []
     seen_ids = set()
-    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    pages = []
+
 
     while total is None or len(all_items) < total:
         params = {"limit": limit, "skip": skip, **(extra_params or {})}
-
         http_response = _fetch_page(endpoint, params=params)
-        payload = http_response.json()
+        file_path = _save_raw_page(resource, params, run_id, response_body=http_response.content)
 
-        _save_raw_page(payload, resource, params, run_id, status_code=http_response.status_code)
-
-        items, total = _validate_page(payload, resource, skip=skip, limit=limit, expected_total=total)
+        items, total = _validate_page(http_response, resource, skip=skip, limit=limit, expected_total=total)
+        
+        hash_value = _calculate_hash(http_response.content)
+        pages.append({
+            "file_name": file_path.name,
+            "endpoint": endpoint, 
+            "status_code": http_response.status_code,
+            "params": params,
+            "received_count": len(items),
+            "total": total,
+            "sha256": hash_value,
+        })
 
         duplicate_ids = seen_ids & {item["id"] for item in items}
 
@@ -129,14 +149,29 @@ def _get_all(endpoint, resource, *, extra_params=None):
             f"Mismatch between fetched {resource} and total: fetched={len(all_items)}, total={total}"
         )
 
-    return all_items
-          
+    return pages
 
-def get_all_carts():
-    return _get_all("carts", "carts")
+def get_all_carts(run_id):
+    return _get_all("carts", "carts", run_id=run_id)
 
-def get_all_users():
-    return _get_all("users", "users", extra_params={"select": "id,firstName,lastName,address,company"})
+def get_all_users(run_id):
+    return _get_all("users", "users", extra_params={"select": "id,firstName,lastName,address,company"}, run_id=run_id)
+
+def create_manifest(run_id, users_pages, carts_pages, started_at, finished_at, status):
+    folder = "output/raw"
+    file_path = Path(folder) / run_id / "manifest.json"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "status": status,
+        "run_id": run_id,
+        "users_pages": users_pages,
+        "carts_pages": carts_pages,
+    }
+
+    file_path.write_text(json.dumps(manifest, indent=4))
 
 
-get_all_carts()
+    
