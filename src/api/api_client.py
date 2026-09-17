@@ -92,6 +92,14 @@ def _validate_page(http_response, resource, *, skip, limit, expected_total):
             f"Unexpected skip: requested={skip}, returned={payload['skip']}"
         )
 
+    expected_count = min(limit, total - skip)
+
+    if payload["limit"] != expected_count:
+        raise ValueError(
+            f"Unexpected limit: expected={expected_count}, returned={payload['limit']}"
+        )
+
+
     for item in items:
         if not isinstance(item, dict) or "id" not in item:
             raise ValueError(f"Invalid item in '{resource}'")
@@ -110,20 +118,18 @@ def _calculate_hash(response_in_bytes):
     return hashlib.sha256(response_in_bytes).hexdigest()
 
 
-def _get_all(endpoint, resource, *, extra_params=None, run_id):
+def _get_all(endpoint, resource, pages, run_id,  *, extra_params=None ):
     skip, limit, total = 0, 10, None
     all_items = []
     seen_ids = set()
-    pages = []
-
-
+    
     while total is None or len(all_items) < total:
         params = {"limit": limit, "skip": skip, **(extra_params or {})}
         http_response = _fetch_page(endpoint, params=params)
         file_path = _save_raw_page(resource, params, run_id, response_body=http_response.content)
 
         items, total = _validate_page(http_response, resource, skip=skip, limit=limit, expected_total=total)
-        
+    
         hash_value = _calculate_hash(http_response.content)
         pages.append({
             "file_name": file_path.name,
@@ -149,13 +155,12 @@ def _get_all(endpoint, resource, *, extra_params=None, run_id):
             f"Mismatch between fetched {resource} and total: fetched={len(all_items)}, total={total}"
         )
 
-    return pages
+def get_all_carts(run_id, pages):
+    _get_all("carts", "carts", pages, run_id=run_id)
+  
 
-def get_all_carts(run_id):
-    return _get_all("carts", "carts", run_id=run_id)
-
-def get_all_users(run_id):
-    return _get_all("users", "users", extra_params={"select": "id,firstName,lastName,address,company"}, run_id=run_id)
+def get_all_users(run_id, pages):
+    _get_all("users", "users", pages, run_id=run_id, extra_params={"select": "id,firstName,lastName,address,company"})
 
 def create_manifest(run_id, users_pages, carts_pages, started_at, finished_at, status):
     folder = "output/raw"
